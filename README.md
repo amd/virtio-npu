@@ -20,22 +20,22 @@
     ```
     here is an example:
     ```
-qemu-system-x86_64 \
--machine q35,accel=kvm \
--object memory-backend-memfd,id=mem0,size=16G,share=on \
--machine q35,memory-backend=mem0,accel=kvm \
--enable-kvm \
--kernel /boot/vmlinuz-$(uname -r) \
--initrd /boot/initrd.img-$(uname -r) \
--append "root=/dev/vda rootfstype=ext4 console=ttyS0 rw rootwait noresume" \
--drive file=ubuntu-24.04.img,format=raw,if=virtio,id=hd0 \
--device virtio-accel-pci,accel-node=accel0 \
--nographic \
--display none \
--d guest_errors \
--D qemu-boot.log \
--trace "virtio_accel*" \
--trace "virtio_gpu_*"
+    qemu-system-x86_64 \
+    -machine q35,accel=kvm \
+    -object memory-backend-memfd,id=mem0,size=16G,share=on \
+    -machine q35,memory-backend=mem0,accel=kvm \
+    -enable-kvm \
+    -kernel /boot/vmlinuz-$(uname -r) \
+    -initrd /boot/initrd.img-$(uname -r) \
+    -append "root=/dev/vda rootfstype=ext4 console=ttyS0 rw rootwait noresume" \
+    -drive file=ubuntu-24.04.img,format=raw,if=virtio,id=hd0 \
+    -device virtio-accel-pci,accel-node=accel0 \
+    -nographic \
+    -display none \
+    -d guest_errors \
+    -D qemu-boot.log \
+    -trace "virtio_accel*" \
+    -trace "virtio_gpu_*"
     ```
 
 ## Test
