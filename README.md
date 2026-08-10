@@ -1,32 +1,46 @@
 # virtio-npu
 
 ## Build instructions
-```
-git clone https://github.com/amd/virtio-npu.git
-cd virtio-npu
-git submodule update --init --recursive
-./configure
-./build.sh
-```
+- Follow README from https://github.com/amd/xdna-driver/tree/main to build xdna staging driver, shim and vxdna libraries and install:
+  - shim library: `libxrt_driver_xdna.so`
+  - vxdna library: `libvxdna.so`
+- Commpile QEMU with virtio npu backend patches:
+  - Get upstream QEMU source code from https://gitlab.com/qemu-project/qemu.git
+  - apply the patches in `patches/qemu/` to the QEMU source code
+  - compile qemu, reference build script: `build-qemu.sh`
 
-#### xdna-driver submodule
-- Build and install amdxdna driver on host side
-- Build and run tests in VM
- 
-Please see https://github.com/amd/xdna-driver
 ## Start VM with NPU
-
-### Build kernel image and rootfs. Then start the VM.
-```
-# Kernel: /scratch/bzImage
-# Rootfs: /scratch/rootfs.img
-
-qemu-system-x86_64 -enable-kvm -object memory-backend-memfd,id=mem1,size=8G -machine q35,accel=kvm,usb=off,dump-guest-core=off,memory-backend=mem1 -smp 4,sockets=4,cores=1,threads=1 -kernel /scratch/bzImage -nographic -append "root=/dev/vda console=ttyS0" -drive file=/scratch/rootfs.img,media=disk,cache=none,if=virtio -device virtio-accel-pci,accel-node=accel0 -cpu host
-```
+- you will need to have Linux kernel and rootfs images for VM
+- launch VM with QEMU:
+  - specify npu device: `-device virtio-accel-pci,accel-node=accel0`
+  - make usre to use shared memory backend:
+    ```
+     -object memory-backend-memfd,id=mem0,size=16G,share=on \
+     -machine q35,memory-backend=mem0,accel=kvm
+    ```
+    here is an example:
+    ```
+qemu-system-x86_64 \
+-machine q35,accel=kvm \
+-object memory-backend-memfd,id=mem0,size=16G,share=on \
+-machine q35,memory-backend=mem0,accel=kvm \
+-enable-kvm \
+-kernel /boot/vmlinuz-$(uname -r) \
+-initrd /boot/initrd.img-$(uname -r) \
+-append "root=/dev/vda rootfstype=ext4 console=ttyS0 rw rootwait noresume" \
+-drive file=ubuntu-24.04.img,format=raw,if=virtio,id=hd0 \
+-device virtio-accel-pci,accel-node=accel0 \
+-nographic \
+-display none \
+-d guest_errors \
+-D qemu-boot.log \
+-trace "virtio_accel*" \
+-trace "virtio_gpu_*"
+    ```
 
 ## Test
-
-### Build and run simple test
+run `xrt-smi` on VM
 ```
-gcc -Ivirglrenderer/src/ -Ivirglrenderer/src/drm/amdxdna/ -I/lib/modules/`uname -r`/build/include/uapi/drm/ -L/usr/lib/x86_64-linux-gnu ioctl_test.c -ldrm
+xrt-smi examine
+xrt-smi validate
 ```
