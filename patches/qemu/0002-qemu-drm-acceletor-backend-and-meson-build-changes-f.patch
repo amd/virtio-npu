@@ -1,0 +1,184 @@
+From 9d8486ecbb854d594fb052a0aa4986bf965a3fe7 Mon Sep 17 00:00:00 2001
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Thu, 1 May 2025 10:41:42 -0700
+Subject: [PATCH 2/2] qemu: drm acceletor backend and meson build changes for
+ kvm
+
+Enale virtio-accel backend for virtio-gpu.
+Add virtio-accel compilation option to meson build.
+
+Compilation option:
+--enable-kvm \
+--enable-drm-accel \
+
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Signed-off-by: Wendy Liang <wendy.liang@amd.com>
+Co-authored-by: Wendy Liang <wendy.liang@amd.com>
+---
+ hw/display/meson.build         | 15 +++++++++++++++
+ hw/display/virtio-gpu-base.c   |  3 ++-
+ hw/display/virtio-gpu.c        |  1 +
+ include/hw/virtio/virtio-gpu.h |  6 ++++++
+ meson.build                    |  7 +++++++
+ meson_options.txt              |  2 ++
+ scripts/meson-buildoptions.sh  |  3 +++
+ 7 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index ffecedbf709..caeb95c0e02 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -90,6 +90,13 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
+                                if_true: [files('virtio-gpu-rutabaga.c'), pixman])
+     hw_display_modules += {'virtio-gpu-rutabaga': virtio_gpu_rutabaga_ss}
+   endif
++
++  if drm_accel.found()
++    virtio_accel_ss = ss.source_set()
++    virtio_accel_ss.add(when: ['CONFIG_VIRTIO_GPU'],
++                        if_true: [files('virtio-accel.c'), drm_accel])
++    hw_display_modules += {'virtio-accel': virtio_accel_ss}
++  endif
+ endif
+ 
+ if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
+@@ -106,12 +113,20 @@ if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
+                              if_true: [files('virtio-gpu-pci-gl.c'), pixman])
+     hw_display_modules += {'virtio-gpu-pci-gl': virtio_gpu_pci_gl_ss}
+   endif
++
+   if rutabaga.found()
+     virtio_gpu_pci_rutabaga_ss = ss.source_set()
+     virtio_gpu_pci_rutabaga_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI', rutabaga],
+                                    if_true: [files('virtio-gpu-pci-rutabaga.c'), pixman])
+     hw_display_modules += {'virtio-gpu-pci-rutabaga': virtio_gpu_pci_rutabaga_ss}
+   endif
++
++  if drm_accel.found()
++    virtio_accel_pci_ss = ss.source_set()
++    virtio_accel_pci_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI'],
++                            if_true: [files('virtio-accel-pci.c'), drm_accel])
++    hw_display_modules += {'virtio-accel-pci': virtio_accel_pci_ss}
++  endif
+ endif
+ 
+ if config_all_devices.has_key('CONFIG_VIRTIO_VGA')
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 270fbaae102..0c3a87aa312 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -261,7 +261,8 @@ virtio_gpu_base_get_features(VirtIODevice *vdev, uint64_t features,
+     VirtIOGPUBase *g = VIRTIO_GPU_BASE(vdev);
+ 
+     if (virtio_gpu_virgl_enabled(g->conf) ||
+-        virtio_gpu_rutabaga_enabled(g->conf)) {
++        virtio_gpu_rutabaga_enabled(g->conf) ||
++        virtio_accel_enabled(g->conf)) {
+         features |= (1 << VIRTIO_GPU_F_VIRGL);
+     }
+     if (virtio_gpu_edid_enabled(g->conf)) {
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index fbb6fec7a0a..8585aa7d872 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1602,6 +1602,7 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+     if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
+         if (!virtio_gpu_rutabaga_enabled(g->parent_obj.conf) &&
+             !virtio_gpu_virgl_enabled(g->parent_obj.conf) &&
++            !virtio_accel_enabled(g->parent_obj.conf) &&
+             !virtio_gpu_have_udmabuf()) {
+             error_setg(errp, "need rutabaga or udmabuf for blob resources");
+             return;
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 71c5f469bc3..bb2ada34c69 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -43,6 +43,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VhostUserGPU, VHOST_USER_GPU)
+ #define TYPE_VIRTIO_GPU_RUTABAGA "virtio-gpu-rutabaga-device"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOGPURutabaga, VIRTIO_GPU_RUTABAGA)
+ 
++#define TYPE_VIRTIO_ACCEL "virtio-accel-device"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOAccel, VIRTIO_ACCEL)
++
+ struct virtio_gpu_simple_resource {
+     uint32_t resource_id;
+     uint32_t width;
+@@ -101,6 +104,7 @@ enum virtio_gpu_base_conf_flags {
+     VIRTIO_GPU_FLAG_VENUS_ENABLED,
+     VIRTIO_GPU_FLAG_RESOURCE_UUID_ENABLED,
+     VIRTIO_GPU_FLAG_DRM_ENABLED,
++    VIRTIO_GPU_FLAG_ACCEL_ENABLED,
+ };
+ 
+ #define virtio_gpu_virgl_enabled(_cfg) \
+@@ -125,6 +129,8 @@ enum virtio_gpu_base_conf_flags {
+     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_VENUS_ENABLED))
+ #define virtio_gpu_drm_enabled(_cfg) \
+     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_DRM_ENABLED))
++#define virtio_accel_enabled(_cfg) \
++    (_cfg.flags & (1 << VIRTIO_GPU_FLAG_ACCEL_ENABLED))
+ 
+ struct virtio_gpu_base_conf {
+     uint32_t max_outputs;
+diff --git a/meson.build b/meson.build
+index 49a5baf5b52..67404e0e201 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1423,6 +1423,12 @@ if not get_option('rutabaga_gfx').auto() or have_system or have_vhost_user_gpu
+                          method: 'pkg-config',
+                          required: get_option('rutabaga_gfx'))
+ endif
++drm_accel = not_found
++if not get_option('drm_accel').auto() or have_system
++  drm_accel = dependency('vxdna',
++                         method: 'pkg-config',
++                         required: get_option('drm_accel'))
++endif
+ blkio = not_found
+ if not get_option('blkio').auto() or have_block
+   blkio = dependency('blkio',
+@@ -4900,6 +4906,7 @@ summary_info += {'SDL image support': sdl_image}
+ summary_info += {'GTK support':       gtk}
+ summary_info += {'pixman':            pixman}
+ summary_info += {'VTE support':       vte}
++summary_info += {'DRM based accelerator support': drm_accel}
+ summary_info += {'PNG support':       png}
+ summary_info += {'VNC support':       vnc}
+ if vnc.found()
+diff --git a/meson_options.txt b/meson_options.txt
+index a07cb47d35e..ef049dc2ed4 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -252,6 +252,8 @@ option('virglrenderer', type : 'feature', value : 'auto',
+        description: 'virgl rendering support')
+ option('rutabaga_gfx', type : 'feature', value : 'auto',
+        description: 'rutabaga_gfx support')
++option('drm_accel', type : 'feature', value : 'auto',
++       description: 'DRM accelerator support')
+ option('png', type : 'feature', value : 'auto',
+        description: 'PNG support with libpng')
+ option('vnc', type : 'feature', value : 'auto',
+diff --git a/scripts/meson-buildoptions.sh b/scripts/meson-buildoptions.sh
+index c003985047c..df964da7b8b 100644
+--- a/scripts/meson-buildoptions.sh
++++ b/scripts/meson-buildoptions.sh
+@@ -115,6 +115,7 @@ meson_options_help() {
+   printf "%s\n" '  dbus-display    -display dbus support'
+   printf "%s\n" '  dmg             dmg image format support'
+   printf "%s\n" '  docs            Documentations build support'
++  printf "%s\n" '  drm-accel       DRM accelerator support'
+   printf "%s\n" '  dsound          DirectSound sound support'
+   printf "%s\n" '  fuse            FUSE block device export'
+   printf "%s\n" '  fuse-lseek      SEEK_HOLE/SEEK_DATA support for FUSE exports'
+@@ -311,6 +312,8 @@ _meson_option_parse() {
+     --docdir=*) quote_sh "-Ddocdir=$2" ;;
+     --enable-docs) printf "%s" -Ddocs=enabled ;;
+     --disable-docs) printf "%s" -Ddocs=disabled ;;
++    --enable-drm-accel) printf "%s" -Ddrm_accel=enabled ;;
++    --disable-drm-accel) printf "%s" -Ddrm_accel=disabled ;;
+     --enable-dsound) printf "%s" -Ddsound=enabled ;;
+     --disable-dsound) printf "%s" -Ddsound=disabled ;;
+     --enable-fdt) printf "%s" -Dfdt=enabled ;;
+-- 
+2.43.0
+

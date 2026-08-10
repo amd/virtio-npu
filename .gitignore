@@ -1,3 +1,2 @@
-qemu
-virglrenderer
 build
+*.o
