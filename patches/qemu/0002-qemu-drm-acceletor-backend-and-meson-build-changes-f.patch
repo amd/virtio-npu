@@ -1,4 +1,4 @@
-From 9d8486ecbb854d594fb052a0aa4986bf965a3fe7 Mon Sep 17 00:00:00 2001
+From fc38d27388e9d16059766411949831701f46ade6 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:41:42 -0700
 Subject: [PATCH 2/2] qemu: drm acceletor backend and meson build changes for
@@ -14,6 +14,8 @@ Compilation option:
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 Signed-off-by: Wendy Liang <wendy.liang@amd.com>
 Co-authored-by: Wendy Liang <wendy.liang@amd.com>
+Change-Id: I24ac1bfbfca07d3c15444ffab2edeca97632f982
+(cherry picked from commit 025cee55d438cd3eb01dd9dd7d0ffa3ee585ef17)
 ---
  hw/display/meson.build         | 15 +++++++++++++++
  hw/display/virtio-gpu-base.c   |  3 ++-
@@ -90,7 +92,7 @@ index fbb6fec7a0a..8585aa7d872 100644
              error_setg(errp, "need rutabaga or udmabuf for blob resources");
              return;
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 71c5f469bc3..bb2ada34c69 100644
+index 14dd62ed4f5..b13bedbb4ef 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
 @@ -43,6 +43,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VhostUserGPU, VHOST_USER_GPU)

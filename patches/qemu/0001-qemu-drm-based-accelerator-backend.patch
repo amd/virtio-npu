@@ -1,4 +1,4 @@
-From be536746846d5a07c46073bd99e115d405c8c1e6 Mon Sep 17 00:00:00 2001
+From c3cfd3a03f90fd974960280e0194d5ec6ee0b07c Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:32:01 -0700
 Subject: [PATCH 1/2] qemu: drm based accelerator backend
@@ -24,12 +24,14 @@ buffer with host memory:
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 Signed-off-by: Wendy Liang <wendy.liang@amd.com>
 Co-authored-by: Wendy Liang <wendy.liang@amd.com>
+Change-Id: I6ed96df5929c7f3018d13087c32a459e9314223c
+(cherry picked from commit cc4d21e7c930fa55315d14c76d12bc36a1f06910)
 ---
  hw/display/trace-events        |   9 +
  hw/display/virtio-accel-pci.c  |  52 +++
- hw/display/virtio-accel.c      | 616 +++++++++++++++++++++++++++++++++
+ hw/display/virtio-accel.c      | 683 +++++++++++++++++++++++++++++++++
  include/hw/virtio/virtio-gpu.h |  23 ++
- 4 files changed, 700 insertions(+)
+ 4 files changed, 767 insertions(+)
  create mode 100644 hw/display/virtio-accel-pci.c
  create mode 100644 hw/display/virtio-accel.c
 
@@ -113,10 +115,10 @@ index 00000000000..4a90e181814
 +module_dep("hw-display-virtio-gpu-pci");
 diff --git a/hw/display/virtio-accel.c b/hw/display/virtio-accel.c
 new file mode 100644
-index 00000000000..02c6860d777
+index 00000000000..6446e8b3fb1
 --- /dev/null
 +++ b/hw/display/virtio-accel.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,683 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Virtio Accelerator Device
@@ -237,16 +239,11 @@ index 00000000000..02c6860d777
 +
 +static void virtio_accel_realize(DeviceState *qdev, Error **errp)
 +{
++    ERRP_GUARD();
 +    VirtIOGPUBase *bdev = VIRTIO_GPU_BASE(qdev);
 +    VirtIOGPU *g = VIRTIO_GPU(qdev);
 +    VirtIOAccel *accel = VIRTIO_ACCEL(g);
 +    int ret;
-+
-+    /* Set up the fence-completion BH before any context (hence polling thread)
-+     * can exist and call accel_write_context_fence(). */
-+    QSLIST_INIT(&accel->async_fenceq);
-+    accel->fence_bh = aio_bh_new(qemu_get_aio_context(),
-+                                 accel_context_fence_bh, g);
 +
 +    bdev->virtio_config.num_capsets = 1;
 +    bdev->conf.max_outputs = 0;
@@ -255,13 +252,26 @@ index 00000000000..02c6860d777
 +    bdev->conf.flags |= (1 << VIRTIO_GPU_FLAG_DMABUF_ENABLED);
 +    bdev->conf.flags |= (1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED);
 +
++    /* Set up the fence-completion BH before any context (hence polling thread)
++     * can exist and call accel_write_context_fence(). */
++    QSLIST_INIT(&accel->async_fenceq);
++    accel->fence_bh = aio_bh_new(qemu_get_aio_context(),
++                                 accel_context_fence_bh, g);
++
 +    ret = vaccel_create(g, VIRACCEL_CAPSET_ID_AMDXDNA, &vaccel_cbs);
 +    if (ret) {
 +        error_setg(errp, "Init specified accel device failed");
++        qemu_bh_delete(accel->fence_bh);
++        accel->fence_bh = NULL;
 +        return;
 +    }
 +
 +    virtio_gpu_device_realize(qdev, errp);
++    if (*errp) {
++        vaccel_destroy(g);
++        qemu_bh_delete(accel->fence_bh);
++        accel->fence_bh = NULL;
++    }
 +}
 +
 +static void virtio_accel_unrealize(DeviceState *qdev)
@@ -441,6 +451,25 @@ index 00000000000..02c6860d777
 +    return;
 +}
 +
++/*
++ * Tear down a blob's host mapping. Remove the MemoryRegion from the guest
++ * address space first: del_subregion commits the memory transaction and drops
++ * the KVM memslot, so a concurrent vCPU can no longer reach the backing before
++ * vaccel_resource_unmap() munmaps it. Returns the vaccel_resource_unmap() result.
++ */
++static int accel_resource_unmap_region(VirtIOGPU *g, struct accel_resource *vres)
++{
++    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
++    MemoryRegion *mr = vres->region;
++
++    memory_region_set_enabled(mr, false);
++    memory_region_del_subregion(&b->hostmem, mr);
++    object_unparent(OBJECT(mr));
++    vres->region = NULL;
++
++    return vaccel_resource_unmap(g, vres->base.resource_id);
++}
++
 +static void accel_cmd_resource_map_blob(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 +{
 +    struct virtio_gpu_resource_map_blob mblob;
@@ -489,12 +518,21 @@ index 00000000000..02c6860d777
 +        return;
 +    }
 +
-+    vres->region = MEMORY_REGION(object_new(TYPE_MEMORY_REGION));
-+    if (!vres->region) {
-+        qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to create memory region\n", __func__);
-+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++    /*
++     * mblob.offset is guest-controlled: reject a mapping that would fall outside
++     * the hostmem window (overflow-safe) before installing the subregion.
++     */
++    if (size > b->conf.hostmem || mblob.offset > b->conf.hostmem - size) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: map offset 0x%" PRIx64 " size 0x%" PRIx64
++                      " exceeds hostmem window 0x%" PRIx64 "\n",
++                      __func__, mblob.offset, size, b->conf.hostmem);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++        vaccel_resource_unmap(g, vres->base.resource_id);
 +        return;
 +    }
++
++    vres->region = MEMORY_REGION(object_new(TYPE_MEMORY_REGION));
 +    mr = vres->region;
 +
 +    memory_region_init_ram_ptr(mr, OBJECT(mr), "blob", size, data);
@@ -513,8 +551,6 @@ index 00000000000..02c6860d777
 +{
 +    struct accel_resource *vres;
 +    struct virtio_gpu_resource_unmap_blob ublob;
-+    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
-+    MemoryRegion *mr;
 +    int ret;
 +
 +    VIRTIO_GPU_FILL_CMD(ublob);
@@ -540,20 +576,13 @@ index 00000000000..02c6860d777
 +    }
 +
 +    trace_virtio_accel_cmd_resource_unmap_blob(vres->base.resource_id);
-+    ret = vaccel_resource_unmap(g, vres->base.resource_id);
++    ret = accel_resource_unmap_region(g, vres);
 +    if (ret) {
 +        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource unmap error: %s\n",
 +                      __func__, strerror(-ret));
 +        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
 +        return;
 +    }
-+
-+    mr = vres->region;
-+    memory_region_set_enabled(mr, false);
-+    memory_region_del_subregion(&b->hostmem, mr);
-+    object_unparent(OBJECT(mr));
-+
-+    vres->region = NULL;
 +}
 +
 +static void accel_cmd_resource_unref(VirtIOGPU *g,
@@ -561,6 +590,7 @@ index 00000000000..02c6860d777
 +{
 +    struct virtio_gpu_resource_unref unref;
 +    struct virtio_gpu_simple_resource *res;
++    struct accel_resource *vres;
 +    struct iovec *res_iovs = NULL;
 +    uint32_t num_iovs = 0;
 +
@@ -573,6 +603,17 @@ index 00000000000..02c6860d777
 +                      __func__, unref.resource_id);
 +        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
 +        return;
++    }
++
++    /*
++     * Do not trust the guest to unmap before unref: a still-mapped blob leaves
++     * a MemoryRegion in the hostmem window backed by memory that the destroy
++     * below frees, which the guest could then reach through its BAR. Tear the
++     * mapping down first.
++     */
++    vres = to_accel_res(res);
++    if (vres->region) {
++        accel_resource_unmap_region(g, vres);
 +    }
 +
 +    vaccel_detach_resource_blob(g, unref.resource_id,
@@ -593,9 +634,22 @@ index 00000000000..02c6860d777
 +    struct virtio_gpu_cmd_submit cs;
 +    void *buf;
 +    size_t s;
++    size_t available;
 +    int ret;
 +
 +    VIRTIO_GPU_FILL_CMD(cs);
++
++    /*
++     * cs.size is guest-controlled; bound it by the bytes actually present in the
++     * command buffer (after the header) so we don't attempt a huge g_malloc().
++     */
++    available = iov_size(cmd->elem.out_sg, cmd->elem.out_num);
++    if (available < sizeof(cs) || cs.size > available - sizeof(cs)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: submit size %u exceeds buffer\n",
++                      __func__, cs.size);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++        return;
++    }
 +
 +    buf = g_malloc(cs.size);
 +    s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
@@ -671,10 +725,29 @@ index 00000000000..02c6860d777
 +        return;
 +    }
 +
-+    if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
-+        virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
++    if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
++        int ret;
++
++        ret = vaccel_submit_fence(g, cmd->cmd_hdr.ctx_id, 0,
++                                  cmd->cmd_hdr.ring_idx, cmd->cmd_hdr.fence_id);
++        if (ret) {
++            /*
++             * On success the command is left unfinished so the base cmdq loop
++             * queues it on g->fenceq and the fence-polling thread completes it
++             * later. If submission fails no completion is ever produced, so
++             * respond now (which sets cmd->finished) to avoid stranding the
++             * command on fenceq and leaking g->inflight.
++             */
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: fence submit failed (ctx %u, ring %u, fence %"
++                          PRIu64 "): %s\n", __func__, cmd->cmd_hdr.ctx_id,
++                          cmd->cmd_hdr.ring_idx, cmd->cmd_hdr.fence_id,
++                          strerror(-ret));
++            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_ERR_UNSPEC);
++        }
 +        return;
 +    }
++    virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
 +}
 +
 +static void virtio_accel_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
@@ -693,10 +766,6 @@ index 00000000000..02c6860d777
 +        cmd->finished = false;
 +        QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
 +        virtio_gpu_process_cmdq(g);
-+
-+        if (!cmd->finished && (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
-+            (void)vaccel_submit_fence(g, cmd->cmd_hdr.ctx_id, 0, cmd->cmd_hdr.ring_idx, cmd->cmd_hdr.fence_id);
-+        }
 +        cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
 +    }
 +}
@@ -734,12 +803,12 @@ index 00000000000..02c6860d777
 +module_kconfig(VIRTIO_GPU);
 +module_dep("hw-display-virtio-gpu");
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index 220231ec9d4..71c5f469bc3 100644
+index 220231ec9d4..14dd62ed4f5 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -299,6 +299,29 @@ struct VirtIOGPURutabaga {
-     struct rutabaga *rutabaga;
- };
+@@ -307,6 +307,29 @@ struct VirtIOGPURutabaga {
+  */
+ #define VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE (4 * MiB)
  
 +struct accel_context_fence {
 +    uint32_t ctx_id;
@@ -764,9 +833,9 @@ index 220231ec9d4..71c5f469bc3 100644
 +    QSLIST_HEAD(, accel_context_fence) async_fenceq;
 +};
 +
- /*
-  * With 4 KiB pages and QEMU's VIRTQUEUE_MAX_SIZE (1024) mapped-iov
-  * limit, the largest inline command is ~4 MiB.  Cap submit_3d
+ #define VIRTIO_GPU_FILL_CMD(out) do {                                   \
+         size_t virtiogpufillcmd_s_ =                                    \
+             iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0,          \
 -- 
 2.43.0
 
